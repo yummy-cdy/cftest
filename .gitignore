@@ -1,3 +1,20 @@
+# Python
 __pycache__/
-*.pyc
-app.db
+*.py[cod]
+
+# 가상환경
+.venv/
+venv/
+
+# 테스트 캐시
+.pytest_cache/
+
+# 로컬 DB (사용자 계정/비밀번호 해시가 들어있다)
+*.db
+memo.db
+
+# 환경변수 (SECRET_KEY 등)
+.env
+
+# macOS
+.DS_Store
