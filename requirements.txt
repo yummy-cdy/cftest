@@ -1,2 +1,3 @@
-Flask
-MarkupSafe
+Flask==2.2.5
+MarkupSafe==2.1.3
+python-dotenv==0.21.0

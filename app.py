@@ -1,20 +1,36 @@
+import os
 import sqlite3
+from datetime import timedelta
 from functools import wraps
 from pathlib import Path
 
+from dotenv import load_dotenv
 from flask import Flask, g, redirect, render_template_string, request, session, url_for
 from markupsafe import escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
+load_dotenv()
+
 DB_PATH = Path(__file__).parent / "app.db"
 
-# 데모용 초기 admin 계정 / 시드 메모 - 운영 환경에서는 반드시 값을 변경하세요.
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin1234!"
-ADMIN_FLAG = "SBOB{admin_only_memo_flag}"
+# 운영 배포 시 CF_ENV=production 으로 설정하면 디버거가 꺼지고 쿠키에 Secure 플래그가 붙는다.
+IS_PRODUCTION = os.environ.get("CF_ENV", "development") == "production"
+
+# 비밀 값은 .env(버전관리 제외)나 환경변수로 주입한다. 아래 기본값은 로컬 개발용으로만 사용할 것.
+SECRET_KEY = os.environ.get("CF_SECRET_KEY", "dev-only-insecure-secret-set-CF_SECRET_KEY-env-var")
+ADMIN_USERNAME = os.environ.get("CF_ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("CF_ADMIN_PASSWORD", "admin1234!")
+ADMIN_FLAG = os.environ.get("CF_ADMIN_FLAG", "SBOB{admin_only_memo_flag}")
 
 app = Flask(__name__)
-app.secret_key = "dev-secret-key-change-me"
+app.secret_key = SECRET_KEY
+# 세션 만료/쿠키 보안 옵션: 로그인 유지 시간을 제한하고 클라이언트 스크립트/HTTP 평문 전송으로부터 세션 쿠키를 보호한다.
+app.config.update(
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=60),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=IS_PRODUCTION,
+)
 
 
 def get_db():
@@ -196,6 +212,7 @@ def login():
         if user is None or not check_password_hash(user["password_hash"], password):
             error = "아이디 또는 비밀번호가 올바르지 않습니다."
         else:
+            session.permanent = True  # PERMANENT_SESSION_LIFETIME 만료 정책 적용 (SEC-002)
             session["user_id"] = user["id"]
             session["username"] = user["username"]
             session["is_admin"] = bool(user["is_admin"])
@@ -381,4 +398,6 @@ def admin_users():
 
 if __name__ == "__main__":
     init_db()
-    app.run(debug=True)
+    # 운영 환경(CF_ENV=production)에서는 Werkzeug 디버거/리로더를 반드시 꺼야 한다.
+    # 디버거가 켜진 채로 외부에 노출되면 임의 코드 실행으로 이어질 수 있다.
+    app.run(debug=not IS_PRODUCTION)
