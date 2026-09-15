@@ -11,7 +11,11 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
 
-DB_PATH = Path(__file__).parent / "app.db"
+# 컨테이너에서는 CF_DATA_DIR을 볼륨 마운트 경로(예: /app/data)로 지정해 DB가
+# 컨테이너 재생성 후에도 유지되도록 한다. 로컬 개발 시에는 app.py 옆에 저장된다.
+DATA_DIR = Path(os.environ.get("CF_DATA_DIR", Path(__file__).parent))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "app.db"
 
 # 운영 배포 시 CF_ENV=production 으로 설정하면 디버거가 꺼지고 쿠키에 Secure 플래그가 붙는다.
 IS_PRODUCTION = os.environ.get("CF_ENV", "development") == "production"
@@ -398,6 +402,7 @@ def admin_users():
 
 if __name__ == "__main__":
     init_db()
+    # host="0.0.0.0": 컨테이너 밖(포트 매핑)에서 접속하려면 필요하다.
     # 운영 환경(CF_ENV=production)에서는 Werkzeug 디버거/리로더를 반드시 꺼야 한다.
     # 디버거가 켜진 채로 외부에 노출되면 임의 코드 실행으로 이어질 수 있다.
-    app.run(debug=not IS_PRODUCTION)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=not IS_PRODUCTION)
