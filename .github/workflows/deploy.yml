@@ -8,16 +8,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Debug secrets presence (lengths only, no values leaked)
-        run: |
-          echo "GCP_HOST length: ${#GCP_HOST}"
-          echo "GCP_USER length: ${#GCP_USER}"
-          echo "GCP_SSH_KEY length: ${#GCP_SSH_KEY}"
-        env:
-          GCP_HOST: ${{ secrets.GCP_HOST }}
-          GCP_USER: ${{ secrets.GCP_USER }}
-          GCP_SSH_KEY: ${{ secrets.GCP_SSH_KEY }}
-
       - name: Deploy to VM
         uses: appleboy/ssh-action@v1
         with:
@@ -28,3 +18,7 @@ jobs:
             cd cftest
             git pull
             docker compose up -d --build
+            # docker compose up은 compose 설정 자체가 안 바뀌면 바인드 마운트된 파일(Caddyfile
+            # 등) 내용이 바뀌어도 컨테이너를 재시작하지 않는다. Caddy가 매 배포마다 최신
+            # Caddyfile을 다시 읽도록 강제로 재시작한다.
+            docker compose restart caddy
