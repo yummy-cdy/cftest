@@ -3,16 +3,18 @@ import os
 import secrets
 import sqlite3
 import stat
+import time
+from collections import defaultdict
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, g, redirect, render_template_string, request, session, url_for
+from flask import Flask, g, jsonify, redirect, render_template_string, request, session, url_for
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf import CSRFProtect
-from flask_wtf.csrf import generate_csrf
+from flask_wtf.csrf import CSRFError, generate_csrf
 from markupsafe import escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -127,11 +129,20 @@ def init_db():
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
             """
         )
         db.commit()
+
+        # /api/notes가 요구하는 updated_at 컬럼을 이미 배포되어 있던(운영 DB 포함) memos
+        # 테이블에도 안전하게 추가하는 마이그레이션. 이미 있으면 아무 것도 하지 않는다.
+        memo_columns = {row[1] for row in db.execute("PRAGMA table_info(memos)").fetchall()}
+        if "updated_at" not in memo_columns:
+            db.execute("ALTER TABLE memos ADD COLUMN updated_at TIMESTAMP")
+            db.execute("UPDATE memos SET updated_at = created_at WHERE updated_at IS NULL")
+            db.commit()
 
         admin = db.execute(
             "SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,)
@@ -167,6 +178,31 @@ def validate_password_strength(password):
     return None
 
 
+# IP 기준 레이트리밋(Flask-Limiter)만으로는 여러 IP를 돌려가며 특정 계정(특히 admin)만
+# 노리는 분산 무차별 대입 공격을 막기 어려우므로, 계정(아이디) 기준으로도 잠금을 건다.
+LOGIN_LOCKOUT_THRESHOLD = 5
+LOGIN_LOCKOUT_WINDOW_SECONDS = 300
+_failed_login_attempts = defaultdict(list)
+
+
+def _record_failed_login(username):
+    now = time.time()
+    attempts = [t for t in _failed_login_attempts[username] if now - t < LOGIN_LOCKOUT_WINDOW_SECONDS]
+    attempts.append(now)
+    _failed_login_attempts[username] = attempts
+
+
+def _is_login_locked(username):
+    now = time.time()
+    attempts = [t for t in _failed_login_attempts.get(username, []) if now - t < LOGIN_LOCKOUT_WINDOW_SECONDS]
+    _failed_login_attempts[username] = attempts
+    return len(attempts) >= LOGIN_LOCKOUT_THRESHOLD
+
+
+def _clear_failed_logins(username):
+    _failed_login_attempts.pop(username, None)
+
+
 def login_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
@@ -187,7 +223,19 @@ def admin_required(view):
             "SELECT is_admin FROM users WHERE id = ?", (session["user_id"],)
         ).fetchone()
         if not row or not row["is_admin"]:
-            return "권한이 없습니다.", 403
+            return _error_page("권한이 없습니다", "이 페이지에 접근할 권한이 없습니다.", 403)
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def api_login_required(view):
+    # HTML 라우트의 login_required와 달리, 로그인 페이지로 리다이렉트하지 않고
+    # JSON 401을 반환한다 (API 스펙: "401 with a JSON body — not HTML, not a redirect").
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            return jsonify({"error": "authentication required"}), 401
         return view(*args, **kwargs)
 
     return wrapped
@@ -232,38 +280,90 @@ BASE_TEMPLATE = """
 <head>
 <title>{{ title }}</title>
 <style nonce="{{ csp_nonce }}">
-  body { font-family: sans-serif; max-width: 480px; margin: 60px auto; padding: 0 16px; color: #222; }
-  nav { margin-bottom: 20px; }
-  nav a { margin-right: 8px; }
-  h1 { font-size: 20px; }
-  input, textarea { display: block; margin: 8px 0; padding: 6px; width: 100%; box-sizing: border-box; font: inherit; }
-  input[type=submit] { width: auto; padding: 6px 16px; cursor: pointer; }
-  .error { color: #c0392b; }
-  hr { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
-  table { border-collapse: collapse; }
-  td, th { padding: 4px 8px; }
+  :root {
+    --accent: #4f46e5;
+    --accent-dark: #4338ca;
+    --bg: #f3f4f8;
+    --card-bg: #ffffff;
+    --text: #1f2330;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --error: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; min-height: 100vh;
+  }
+  nav {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 14px 20px; background: var(--card-bg); border-bottom: 1px solid var(--border);
+  }
+  nav .brand { font-weight: 700; color: var(--accent); margin-right: auto; }
+  nav .who { color: var(--muted); font-size: 13px; margin-right: 8px; }
+  nav a { color: var(--text); text-decoration: none; font-size: 14px; padding: 6px 10px; border-radius: 6px; }
+  nav a:hover { background: var(--bg); }
+  .page { max-width: 480px; margin: 0 auto; padding: 32px 16px 60px; }
+  .card {
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  }
+  h1 { font-size: 19px; margin: 0 0 16px; }
+  input[type=text], input[type=password], textarea {
+    display: block; width: 100%; margin: 6px 0 14px; padding: 10px 12px;
+    border: 1px solid var(--border); border-radius: 8px; font: inherit; background: #fafafa;
+  }
+  input[type=text]:focus, input[type=password]:focus, textarea:focus {
+    outline: none; border-color: var(--accent); background: #fff;
+  }
+  input[type=submit] {
+    width: auto; padding: 9px 18px; border: none; border-radius: 8px;
+    background: var(--accent); color: #fff; font-weight: 600; font-size: 14px; cursor: pointer;
+  }
+  input[type=submit]:hover { background: var(--accent-dark); }
+  .error {
+    color: var(--error); background: #fef2f2; border: 1px solid #fecaca;
+    padding: 10px 12px; border-radius: 8px; font-size: 14px; margin-bottom: 16px;
+  }
+  .btn {
+    display: inline-block; padding: 8px 14px; border-radius: 8px; background: var(--accent);
+    color: #fff !important; text-decoration: none; font-weight: 600; font-size: 14px;
+  }
+  .btn:hover { background: var(--accent-dark); }
+  .memo-list { list-style: none; padding: 0; margin: 16px 0 0; display: flex; flex-direction: column; gap: 8px; }
+  .memo-list li { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .memo-list a { color: var(--text); text-decoration: none; font-weight: 600; }
+  .memo-list small { color: var(--muted); display: block; margin-top: 2px; font-weight: 400; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
   .inline { display: inline; }
-  #build-info { position: fixed; right: 6px; bottom: 4px; font-size: 11px; color: #aaa; }
+  .muted { color: var(--muted); font-size: 13px; }
+  #build-info { position: fixed; right: 6px; bottom: 4px; font-size: 11px; color: #b7bac2; }
 </style>
 </head>
 <body>
 <nav>
+<span class="brand">CF 메모</span>
 {% if session.get('username') %}
-    <span>{{ session['username'] }}님 환영합니다.</span>
+    <span class="who">{{ session['username'] }}님</span>
     <a href="{{ url_for('memo_list') }}">메모</a>
     {% if session.get('is_admin') %}
     <a href="{{ url_for('admin_users') }}">관리자</a>
     {% endif %}
     <a href="{{ url_for('logout') }}">로그아웃</a>
 {% else %}
-    <a href="{{ url_for('login') }}">로그인</a> <a href="{{ url_for('signup') }}">회원가입</a>
+    <a href="{{ url_for('login') }}">로그인</a>
+    <a href="{{ url_for('signup') }}">회원가입</a>
 {% endif %}
 </nav>
-<hr>
+<div class="page">
 {% if error %}
     <p class="error">{{ error }}</p>
 {% endif %}
+<div class="card">
 {{ body|safe }}
+</div>
+</div>
 <div id="build-info">build: {{ build_info }}</div>
 <script nonce="{{ csp_nonce }}">
 // 인라인 이벤트 핸들러(onclick=...) 대신 CSP를 통과하는 위임 방식으로 삭제 확인창을 띄운다.
@@ -284,10 +384,46 @@ def csrf_field():
     return f'<input type="hidden" name="csrf_token" value="{escape(generate_csrf())}">'
 
 
+def _error_page(title, message, status):
+    body = f"<h1>{escape(title)}</h1><p>{escape(message)}</p>"
+    return render_template_string(BASE_TEMPLATE, title=title, body=body, error=None), status
+
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    # 토큰 위조/누락(공격 시도이거나 세션 만료)을 구분 없이 한 곳에서 기록해 모의 공방전 중
+    # 이상 트래픽을 추적할 수 있게 한다.
+    security_logger.warning(
+        "CSRF validation failed from %s: %s", get_remote_address(), e.description
+    )
+    return _error_page("요청을 처리할 수 없습니다", "세션이 만료되었거나 위조된 요청입니다. 새로고침 후 다시 시도해주세요.", 400)
+
+
+@app.errorhandler(429)
+def handle_rate_limit(e):
+    security_logger.warning("rate limit exceeded from %s", get_remote_address())
+    return _error_page("요청이 너무 많습니다", "잠시 후 다시 시도해주세요.", 429)
+
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    return _error_page("페이지를 찾을 수 없습니다", "주소를 다시 확인해주세요.", 404)
+
+
+@app.errorhandler(500)
+def handle_internal_error(e):
+    # 예외 상세(스택 트레이스 등)는 절대 클라이언트로 내려주지 않고 서버 로그에만 남긴다.
+    security_logger.exception("unhandled server error")
+    return _error_page("일시적인 오류가 발생했습니다", "잠시 후 다시 시도해주세요.", 500)
+
+
 @app.route("/")
 def index():
-    body = "<h1>메인 페이지</h1>"
-    return render_template_string(BASE_TEMPLATE, title="홈", body=body, error=None)
+    # 로그인/회원가입 화면을 앱의 진짜 입구로 삼는다: 로그인 전에는 항상 로그인 화면부터
+    # 보여주고, 로그인 후에는 바로 메모 목록으로 들어가게 한다.
+    if "user_id" in session:
+        return redirect(url_for("memo_list"))
+    return redirect(url_for("login"))
 
 
 @app.route("/signup", methods=["GET", "POST"])
@@ -327,7 +463,8 @@ def signup():
         비밀번호: <input type="password" name="password"><br>
         <input type="submit" value="가입하기">
     </form>
-    """.format(csrf=csrf_field())
+    <p class="muted">이미 계정이 있으신가요? <a href="{login_url}">로그인</a></p>
+    """.format(csrf=csrf_field(), login_url=url_for("login"))
     return render_template_string(BASE_TEMPLATE, title="회원가입", body=body, error=error)
 
 
@@ -339,24 +476,33 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
-        db = get_db()
-        user = db.execute(
-            "SELECT * FROM users WHERE username = ?", (username,)
-        ).fetchone()
-
-        if user is None or not check_password_hash(user["password_hash"], password):
-            error = "아이디 또는 비밀번호가 올바르지 않습니다."
+        if username and _is_login_locked(username):
+            error = "로그인 시도가 너무 많습니다. 5분 후 다시 시도해주세요."
             security_logger.warning(
-                "failed login attempt for %r from %s", username, get_remote_address()
+                "login blocked (lockout) for %r from %s", username, get_remote_address()
             )
         else:
-            session.clear()  # 세션 고정(session fixation) 공격 방지: 로그인 전 상태를 모두 폐기
-            session.permanent = True  # PERMANENT_SESSION_LIFETIME 만료 정책 적용 (SEC-002)
-            session["user_id"] = user["id"]
-            session["username"] = user["username"]
-            session["is_admin"] = bool(user["is_admin"])
-            security_logger.info("login: %s", username)
-            return redirect(url_for("index"))
+            db = get_db()
+            user = db.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+
+            if user is None or not check_password_hash(user["password_hash"], password):
+                error = "아이디 또는 비밀번호가 올바르지 않습니다."
+                if username:
+                    _record_failed_login(username)
+                security_logger.warning(
+                    "failed login attempt for %r from %s", username, get_remote_address()
+                )
+            else:
+                _clear_failed_logins(username)
+                session.clear()  # 세션 고정(session fixation) 공격 방지: 로그인 전 상태를 모두 폐기
+                session.permanent = True  # PERMANENT_SESSION_LIFETIME 만료 정책 적용 (SEC-002)
+                session["user_id"] = user["id"]
+                session["username"] = user["username"]
+                session["is_admin"] = bool(user["is_admin"])
+                security_logger.info("login: %s", username)
+                return redirect(url_for("memo_new"))
 
     body = """
     <h1>로그인</h1>
@@ -366,14 +512,15 @@ def login():
         비밀번호: <input type="password" name="password"><br>
         <input type="submit" value="로그인">
     </form>
-    """.format(csrf=csrf_field())
+    <p class="muted">계정이 없으신가요? <a href="{signup_url}">회원가입</a></p>
+    """.format(csrf=csrf_field(), signup_url=url_for("signup"))
     return render_template_string(BASE_TEMPLATE, title="로그인", body=body, error=error)
 
 
 @app.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for("index"))
+    return redirect(url_for("login"))
 
 
 @app.route("/memos")
@@ -385,15 +532,15 @@ def memo_list():
         (session["user_id"],),
     ).fetchall()
     items = "".join(
-        '<li><a href="{}">{}</a> <small>({})</small></li>'.format(
+        '<li><a href="{}">{}</a><small>{}</small></li>'.format(
             url_for("memo_detail", memo_id=m["id"]), escape(m["title"]), m["created_at"]
         )
         for m in memos
-    ) or "<li>메모가 없습니다.</li>"
+    ) or '<li class="muted">메모가 없습니다.</li>'
     body = """
     <h1>내 메모</h1>
-    <p><a href="{new_url}">새 메모 작성</a></p>
-    <ul>{items}</ul>
+    <p><a class="btn" href="{new_url}">+ 새 메모 작성</a></p>
+    <ul class="memo-list">{items}</ul>
     """.format(new_url=url_for("memo_new"), items=items)
     return render_template_string(BASE_TEMPLATE, title="메모 목록", body=body, error=None)
 
@@ -445,7 +592,7 @@ def _get_own_memo(memo_id):
 def memo_detail(memo_id):
     memo = _get_own_memo(memo_id)
     if memo is None:
-        return "메모를 찾을 수 없습니다.", 404
+        return _error_page("메모를 찾을 수 없습니다", "요청하신 메모가 없거나 접근 권한이 없습니다.", 404)
 
     body = """
     <h1>{title}</h1>
@@ -474,7 +621,7 @@ def memo_detail(memo_id):
 def memo_edit(memo_id):
     memo = _get_own_memo(memo_id)
     if memo is None:
-        return "메모를 찾을 수 없습니다.", 404
+        return _error_page("메모를 찾을 수 없습니다", "요청하신 메모가 없거나 접근 권한이 없습니다.", 404)
 
     error = None
     if request.method == "POST":
@@ -485,7 +632,7 @@ def memo_edit(memo_id):
         else:
             db = get_db()
             db.execute(
-                "UPDATE memos SET title = ?, content = ? WHERE id = ? AND user_id = ?",
+                "UPDATE memos SET title = ?, content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
                 (title, content, memo_id, session["user_id"]),
             )
             db.commit()
@@ -512,7 +659,7 @@ def memo_edit(memo_id):
 def memo_delete(memo_id):
     memo = _get_own_memo(memo_id)
     if memo is None:
-        return "메모를 찾을 수 없습니다.", 404
+        return _error_page("메모를 찾을 수 없습니다", "요청하신 메모가 없거나 접근 권한이 없습니다.", 404)
 
     db = get_db()
     db.execute(
@@ -520,6 +667,77 @@ def memo_delete(memo_id):
     )
     db.commit()
     return redirect(url_for("memo_list"))
+
+
+def _serialize_note(memo):
+    updated_at = memo["updated_at"] if memo["updated_at"] is not None else memo["created_at"]
+    return {
+        "id": memo["id"],
+        "title": memo["title"],
+        "body": memo["content"],
+        "created_at": str(memo["created_at"]),
+        "updated_at": str(updated_at),
+    }
+
+
+@app.route("/api/notes", methods=["GET"])
+@api_login_required
+def api_notes_list():
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, title, content, created_at, updated_at FROM memos WHERE user_id = ? ORDER BY id DESC",
+        (session["user_id"],),
+    ).fetchall()
+    return jsonify({"notes": [_serialize_note(r) for r in rows]})
+
+
+@app.route("/api/notes", methods=["POST"])
+@csrf.exempt  # JSON 전용 엔드포인트: 아래 request.is_json 검사 + CORS 미허용으로 CSRF를 방어한다.
+@api_login_required
+@limiter.limit("30 per minute")
+def api_notes_create():
+    # 브라우저가 cross-site fetch에 커스텀 Content-Type(application/json)을 실어 보내려면
+    # CORS preflight를 통과해야 하는데, 이 서버는 CORS 헤더를 전혀 내려주지 않으므로 다른
+    # 오리진에서의 요청은 프리플라이트 단계에서 막힌다. 즉 form 기반 CSRF는 애초에 불가능하다.
+    if not request.is_json:
+        return jsonify({"error": "Content-Type must be application/json"}), 400
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "invalid JSON body"}), 400
+
+    title = data.get("title")
+    title = title.strip() if isinstance(title, str) else ""
+    if not title:
+        return jsonify({"error": "title is required"}), 400
+
+    body = data.get("body", "")
+    if not isinstance(body, str):
+        body = ""
+
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO memos (user_id, title, content, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+        (session["user_id"], title, body),
+    )
+    db.commit()
+    row = db.execute(
+        "SELECT id, title, content, created_at, updated_at FROM memos WHERE id = ?",
+        (cur.lastrowid,),
+    ).fetchone()
+    security_logger.info("api note created: user=%s note_id=%s", session.get("username"), row["id"])
+    return jsonify(_serialize_note(row)), 201
+
+
+@app.route("/api/notes/<int:note_id>", methods=["GET"])
+@api_login_required
+def api_notes_detail(note_id):
+    memo = _get_own_memo(note_id)
+    if memo is None:
+        # 존재하지 않는 note와 남의 note를 구분하지 않고 둘 다 404로 응답한다(IDOR로 인한
+        # 존재 여부 노출 방지 — 스펙에도 403이 아닌 404로 명시되어 있음).
+        return jsonify({"error": "note not found"}), 404
+    return jsonify(_serialize_note(memo))
 
 
 @app.route("/admin")
