@@ -1,10 +1,23 @@
 services:
   app:
     build: .
-    ports:
-      - "8000:8000"
     volumes:
       - ./data:/app/data
     env_file:
       - .env
     restart: unless-stopped
+
+  caddy:
+    image: caddy:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
