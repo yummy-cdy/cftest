@@ -8,6 +8,16 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Debug secrets presence (lengths only, no values leaked)
+        run: |
+          echo "GCP_HOST length: ${#GCP_HOST}"
+          echo "GCP_USER length: ${#GCP_USER}"
+          echo "GCP_SSH_KEY length: ${#GCP_SSH_KEY}"
+        env:
+          GCP_HOST: ${{ secrets.GCP_HOST }}
+          GCP_USER: ${{ secrets.GCP_USER }}
+          GCP_SSH_KEY: ${{ secrets.GCP_SSH_KEY }}
+
       - name: Deploy to VM
         uses: appleboy/ssh-action@v1
         with:
