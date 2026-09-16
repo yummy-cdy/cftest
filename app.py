@@ -582,7 +582,16 @@ def memo_new():
 def _get_own_memo(memo_id):
     db = get_db()
     memo = db.execute("SELECT * FROM memos WHERE id = ?", (memo_id,)).fetchone()
-    if memo is None or memo["user_id"] != session["user_id"]:
+    if memo is None:
+        return None
+    if memo["user_id"] != session["user_id"]:
+        # 응답은 "존재하지 않음"과 동일한 404로 통일하되(IDOR로 존재 여부가 노출되지 않도록),
+        # 서버 로그에는 실제로 남의 데이터에 접근을 시도한 이벤트만 구분해서 남긴다.
+        # id가 낮을수록(특히 1번, 관리자 flag) 가장 먼저 시도될 만한 값이라 탐지 가치가 크다.
+        security_logger.warning(
+            "IDOR attempt: user=%s tried memo_id=%s (owned by user_id=%s) from %s",
+            session.get("username"), memo_id, memo["user_id"], get_remote_address(),
+        )
         return None
     return memo
 
