@@ -1,3 +1,13 @@
 yyum.buzz {
     reverse_proxy app:8000
+
+    # 백엔드(gunicorn) 서버 정보 노출을 줄이고, 앱이 실패해도 최소한의 보안 헤더가
+    # 항상 붙도록 엣지(reverse proxy)에서도 한 번 더 설정한다(defense in depth).
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
 }

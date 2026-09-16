@@ -16,5 +16,8 @@ memo.db
 # 환경변수 (SECRET_KEY 등)
 .env
 
+# Docker 이미지 빌드 시 생성되는 배포 확인용 타임스탬프(로컬에서 생기면 안됨)
+BUILD_INFO
+
 # macOS
 .DS_Store

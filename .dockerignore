@@ -7,4 +7,5 @@ __pycache__/
 app.db
 data/
 venv/
+.venv/
 .pytest_cache/
